@@ -685,6 +685,14 @@ impl Index {
           match err.downcast_ref() {
             Some(&reorg::Error::Recoverable { height, depth }) => {
               Reorg::handle_reorg(self, height, depth)?;
+
+              if let Some(sender) = &self.event_sender {
+                if sender
+                .blocking_send(Event::ReOrg { height, depth })
+                .is_err() {
+                  log::warn!("reorg event dropped")
+                }
+              }
             }
             Some(&reorg::Error::Unrecoverable) => {
               self

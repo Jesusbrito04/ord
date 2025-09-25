@@ -12,23 +12,49 @@ pub(crate) struct MempoolIndexer {
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct MempoolTransaction {
+  txid: Txid,
   fee: u64,
   raw_tx: Vec<u8>,
   weight: Weight,
+  first_seen: u64,
+  replaces: Option<Txid>,
+  #[serde(default)]
+  replaced_by: Vec<Txid>,
 }
 
 impl MempoolTransaction {
   pub(crate) fn store(&self) -> Vec<u8> {
     let mut buffer = Vec::new();
+    buffer.extend_from_slice(&self.txid.as_ref());
     buffer.extend_from_slice(&self.fee.to_le_bytes());
     buffer.extend_from_slice(&self.weight.to_wu().to_le_bytes());
+    buffer.extend_from_slice(&self.first_seen.to_le_bytes());
+
+    if let Some(replaces_txid) = self.replaces {
+      buffer.push(1); // Some(Txid) exist
+      buffer.extend_from_slice(replaces_txid.as_ref());
+    } else {
+        buffer.push(0); // None
+    }
+
+    buffer.push(self.replaced_by.len() as u8);
+    for txid in &self.replaced_by {
+      buffer.extend_from_slice(txid.as_ref());
+    }
+
     buffer.extend_from_slice(&self.raw_tx);
     buffer
   }
   #[allow(dead_code)]
   pub(crate) fn load(data: &[u8]) -> anyhow::Result<Self> {
+    const TXID_SIZE: usize = 32;
     const U64_SIZE: usize = std::mem::size_of::<u64>();
-    if data.len() < U64_SIZE * 2 {
+    const BOOL_SIZE: usize = 1;
+    const U8_SIZE: usize = 1;
+    
+    let fixed_size = TXID_SIZE + U64_SIZE * 3 + BOOL_SIZE + U8_SIZE;
+
+    if data.len() < fixed_size {
       return Err(anyhow::anyhow!(
         "not enough data to decode MempoolTransaction"
       ));

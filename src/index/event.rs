@@ -17,6 +17,10 @@ pub enum Event {
     old_location: SatPoint,
     sequence_number: u32,
   },
+  ReOrg {
+    height: u32,
+    depth: u32,
+  },
   RuneBurned {
     amount: u128,
     block_height: u32,
