@@ -1,4 +1,5 @@
 use crate::index::MEMPOOL_TRANSACTIONS;
+use std::io::{Cursor, Read};
 use anyhow::Ok;
 use bitcoin::{Txid, Weight};
 use redb::{ReadableTable, WriteTransaction};
@@ -49,27 +50,58 @@ impl MempoolTransaction {
   pub(crate) fn load(data: &[u8]) -> anyhow::Result<Self> {
     const TXID_SIZE: usize = 32;
     const U64_SIZE: usize = std::mem::size_of::<u64>();
-    const BOOL_SIZE: usize = 1;
     const U8_SIZE: usize = 1;
-    
-    let fixed_size = TXID_SIZE + U64_SIZE * 3 + BOOL_SIZE + U8_SIZE;
 
-    if data.len() < fixed_size {
-      return Err(anyhow::anyhow!(
-        "not enough data to decode MempoolTransaction"
-      ));
+    let mut cursor = Cursor::new(data);
+
+    let mut txid_bytes = [0u8; TXID_SIZE];
+    cursor.read_exact(&mut txid_bytes)?;
+    let txid = Txid::from_byte_array(txid_bytes);
+
+    let mut fee_bytes = [0u8; U64_SIZE];
+    cursor.read_exact(&mut fee_bytes)?;
+    let fee = u64::from_le_bytes(fee_bytes);
+
+    let mut weight_bytes = [0u8; U64_SIZE];
+    cursor.read_exact(&mut weight_bytes)?;
+    let weight = Weight::from_wu(u64::from_le_bytes(weight_bytes));
+
+    let mut first_seen_bytes = [0u8; U64_SIZE];
+    cursor.read_exact(&mut first_seen_bytes)?;
+    let first_seen = u64::from_le_bytes(first_seen_bytes);
+
+    let mut has_replaces_byte = [0u8; U8_SIZE];
+    cursor.read_exact(&mut has_replaces_byte);
+    let replaces = if has_replaces_byte[0] == 1 {
+      let mut replaces_txid_bytes = [0u8; TXID_SIZE];
+      cursor.read_exact(&mut replaces_txid_bytes)?;
+      Some(Txid::from_byte_array(replaces_txid_bytes))
+    } else {
+      None
+    };
+
+    let mut replaced_by_len_byte = [0u8; U8_SIZE];
+    cursor.read_exact(&mut replaced_by_len_byte)?;
+    let replaced_by_len = replaced_by_len_byte[0] as usize;
+   
+    let mut replaced_by = Vec::with_capacity(replaced_by_len);
+    for _ in 0..replaced_by_len {
+      let mut txid_bytes = [0u8; TXID_SIZE];
+      cursor.read_exact(&mut txid_bytes)?;
+      replaced_by.push(Txid::from_byte_array(txid_bytes));
     }
-    let (fee_bytes, rest) = data.split_at(U64_SIZE);
-    let fee = u64::from_le_bytes(fee_bytes.try_into()?);
-    let (weight_bytes, rest) = rest.split_at(U64_SIZE);
-    let weight = Weight::from_wu(u64::from_le_bytes(weight_bytes.try_into()?));
-
-    let raw_tx = rest.to_vec();
+   
+    let mut raw_tx = Vec::new();
+    cursor.read_to_end(&mut raw_tx)?;
 
     Ok(Self {
+      txid,
       fee,
       weight,
-      raw_tx,
+      first_seen,
+      replaces,
+      replaced_by,
+      raw_tx
     })
   }
 }
@@ -78,6 +110,7 @@ impl MempoolIndexer {
   pub fn new(index: Arc<Index>) -> Self {
     Self { index }
   }
+
 
   pub(crate) async fn run(self) {
     log::info!("Starting mempool indexer");
