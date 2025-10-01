@@ -1,6 +1,5 @@
 use crate::index::MEMPOOL_TRANSACTIONS;
 use std::io::{Cursor, Read};
-use anyhow::Ok;
 use bitcoin::{Txid, Weight};
 use redb::{ReadableTable, WriteTransaction};
 use serde::{Deserialize, Serialize};
@@ -71,7 +70,7 @@ impl MempoolTransaction {
     let first_seen = u64::from_le_bytes(first_seen_bytes);
 
     let mut has_replaces_byte = [0u8; U8_SIZE];
-    cursor.read_exact(&mut has_replaces_byte);
+    cursor.read_exact(&mut has_replaces_byte)?;
     let replaces = if has_replaces_byte[0] == 1 {
       let mut replaces_txid_bytes = [0u8; TXID_SIZE];
       cursor.read_exact(&mut replaces_txid_bytes)?;
@@ -136,30 +135,86 @@ impl MempoolIndexer {
 
   pub(crate) fn update_mempool(&self, wtx: &mut WriteTransaction) -> anyhow::Result<()> {
     log::info!("Updating Mempool...");
-    let mempool_txids: Vec<Txid> = self.index.client.get_raw_mempool()?;
-    let mut table = wtx.open_table(MEMPOOL_TRANSACTIONS)?;
 
-    for txid in mempool_txids {
-      let key: &[u8] = txid.as_ref();
+    let mut mempool_transactions_by_txid: HashMap<Txid, MempoolTransaction> = HashMap::new();
+    let mut mempool_transactions_by_input: HashMap<OutPoint, Txid> = HashMap::new();
+    
+    for result in wtx.open_table(MEMPOOL_TRANSACTIONS)?.iter()? {
+      let (txid_bytes, tx_data) = result?;
+      let txid = Txid::from_byte_array(txid_bytes.value().try_into().unwrap());
 
-      if table.get(key)?.is_none() {
-        log::debug!("New mempool transaction: {}", txid);
-        match self.index.client.get_mempool_entry(&txid) {
-          Result::Ok(entry) => {
-            let raw_tx = self.index.client.get_raw_transaction(&txid, None)?;
+      let tx = MempoolTransaction::load(tx_data.value())?;
+      let raw_tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&tx.raw_tx)?;
 
-            let mempool_tx = MempoolTransaction {
+      for input in &raw_tx.input {
+        mempool_transactions_by_input.insert(input.previous_output, txid);
+      }
+      mempool_transactions_by_txid.insert(txid, tx);
+    }
+
+    let mempool: Vec<Txid> = self.index.client.get_raw_mempool()?;
+    let mempool_set: HashSet<Txid> = mempool.into_iter().collect();
+
+    for txid in &mempool_set {
+      if mempool_transactions_by_txid.contains_key(txid) {
+        continue;
+      }
+
+      log::debug!("New mempool transaction: {}", txid);
+
+      match self.index.client.get_mempool_entry(txid) {
+          Ok(entry) => {
+            let raw_tx = self.index.client.get_raw_transaction(txid, None)?;
+            let mut conflicts = Vec::new();
+
+            for input in &raw_tx.input {
+              if let Some(conflict_txid) = mempool_transactions_by_input.get(&input.previous_output) {
+                if conflict_txid != txid {
+                  conflicts.push(*conflict_txid);
+                }
+              }
+            }
+
+            let replaces = conflicts.first().cloned();
+
+            for conflict_txid in &conflicts {
+              if let Some(removed_tx) = mempool_transactions_by_txid.remove(conflict_txid) {
+                log::info!("Transaction {} is replacing {}", txid, conflict_txid);
+                let removed_raw_tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&removed_tx.raw_tx)?;
+                for input in &removed_raw_tx.input {
+                  mempool_transactions_by_input.remove(&input.previous_output);
+                }
+              }
+            };
+
+            let new_tx = MempoolTransaction {
+              txid: *txid,
               fee: entry.fees.base.to_sat(),
               weight: Weight::from_wu(entry.weight.unwrap()),
-              raw_tx: bitcoin::consensus::serialize(&raw_tx),
+              first_seen: entry.time as u64,
+              replaces,
+              replaced_by: Vec::new(),
+              raw_tx: bitcoin::consensus::serialize(&raw_tx)
             };
-            let serialize_tx = mempool_tx.store();
-            table.insert(key, serialize_tx.as_slice())?;
-          }
+
+            for input in &raw_tx.input { 
+              mempool_transactions_by_input.insert(input.previous_output, *txid);
+            }
+            mempool_transactions_by_txid.insert(*txid, new_tx);
+          },
           Err(e) => {
             log::debug!("Could not fetch tx {}: {}", txid, e);
-          }
         }
+      }
+    }
+
+    wtx.delete_table(MEMPOOL_TRANSACTIONS)?;
+    let mut table = wtx.open_table(MEMPOOL_TRANSACTIONS)?;
+    
+    for (txid, tx) in mempool_transactions_by_txid {
+      if mempool_set.contains(&txid) {
+        let key: &[u8] = txid.as_ref();
+        table.insert(key, tx.store().as_slice())?;
       }
     }
 
